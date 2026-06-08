@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Claude Remote Approval</title>
+  <title>Claude Gate</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -32,10 +32,10 @@
       display: flex;
       align-items: center;
       gap: 12px;
-      margin-bottom: 28px;
+      margin-bottom: 20px;
     }
 
-    header h1 { font-size: 1.25rem; font-weight: 600; }
+    header h1 { font-size: 1.25rem; font-weight: 600; flex: 1; }
 
     .status-dot {
       width: 8px; height: 8px;
@@ -49,6 +49,62 @@
       0%, 100% { opacity: 1; }
       50% { opacity: 0.4; }
     }
+
+    /* Mode toggle */
+    #mode-bar {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px 16px;
+      margin-bottom: 20px;
+    }
+
+    #mode-bar .mode-label { flex: 1; font-size: 0.875rem; }
+    #mode-bar .mode-desc  { font-size: 0.75rem; color: var(--muted); }
+
+    .toggle-wrap { display: flex; align-items: center; gap: 10px; }
+    .toggle-wrap span { font-size: 0.8rem; }
+    .toggle-wrap span.active { color: var(--text); font-weight: 600; }
+    .toggle-wrap span.inactive { color: var(--muted); }
+
+    .toggle {
+      position: relative;
+      width: 44px; height: 24px;
+      cursor: pointer;
+    }
+    .toggle input { opacity: 0; width: 0; height: 0; }
+    .toggle-slider {
+      position: absolute; inset: 0;
+      background: var(--border);
+      border-radius: 24px;
+      transition: background 0.2s;
+    }
+    .toggle-slider::before {
+      content: '';
+      position: absolute;
+      width: 18px; height: 18px;
+      left: 3px; top: 3px;
+      background: white;
+      border-radius: 50%;
+      transition: transform 0.2s;
+    }
+    .toggle input:checked + .toggle-slider { background: var(--blue); }
+    .toggle input:checked + .toggle-slider::before { transform: translateX(20px); }
+
+    #mode-hint {
+      font-size: 0.75rem;
+      color: var(--muted);
+      margin-bottom: 20px;
+      padding: 8px 14px;
+      background: rgba(245,158,11,0.08);
+      border: 1px solid rgba(245,158,11,0.2);
+      border-radius: 8px;
+      display: none;
+    }
+    #mode-hint.visible { display: block; }
 
     #server-url-bar {
       display: flex;
@@ -153,10 +209,7 @@
     .btn-allow { background: var(--green); color: #000; }
     .btn-deny  { background: var(--red);   color: #fff; }
 
-    .decided {
-      border-color: transparent;
-      opacity: 0.5;
-    }
+    .decided { border-color: transparent; opacity: 0.5; }
     .decided .card-actions { display: none; }
 
     .badge-allowed { background: rgba(34,197,94,0.15); color: var(--green); border: 1px solid rgba(34,197,94,0.3); border-radius: 6px; padding: 2px 10px; font-size: 0.75rem; }
@@ -172,13 +225,31 @@
 <body>
   <header>
     <div class="status-dot" id="dot"></div>
-    <h1>Claude Remote Approval</h1>
+    <h1>Claude Gate</h1>
   </header>
 
   <div id="server-url-bar">
     <input id="server-url" type="text" value="http://localhost:8000" placeholder="Server URL" />
     <button onclick="connect()">Connect</button>
   </div>
+
+  <!-- Mode toggle -->
+  <div id="mode-bar">
+    <div>
+      <div class="mode-label">Approval mode</div>
+      <div class="mode-desc" id="mode-desc">—</div>
+    </div>
+    <div class="toggle-wrap">
+      <span id="lbl-native" class="inactive">Native</span>
+      <label class="toggle">
+        <input type="checkbox" id="mode-toggle" onchange="onModeToggle(this.checked)" />
+        <span class="toggle-slider"></span>
+      </label>
+      <span id="lbl-remote" class="active">Remote</span>
+    </div>
+  </div>
+
+  <div id="mode-hint"></div>
 
   <div id="pending-list">
     <div class="empty" id="empty-msg">No pending requests. Claude Code will prompt here when it needs approval.</div>
@@ -192,12 +263,11 @@
   <script>
     let serverUrl = 'http://localhost:8000';
     let evtSource = null;
-    const cards = {}; // request_id -> card element
+    const cards = {};
     const history = [];
 
     function connect() {
       serverUrl = document.getElementById('server-url').value.replace(/\/$/, '');
-
       if (evtSource) evtSource.close();
 
       evtSource = new EventSource(`${serverUrl}/events`);
@@ -205,13 +275,48 @@
       evtSource.onerror = () => setDot(false);
       evtSource.onmessage = (e) => {
         const msg = JSON.parse(e.data);
-        if (msg.event === 'new_request') addCard(msg.data);
-        if (msg.event === 'decision') markDecided(msg.request_id, msg.decision);
+        if (msg.event === 'new_request')  addCard(msg.data);
+        if (msg.event === 'decision')     markDecided(msg.request_id, msg.decision);
+        if (msg.event === 'mode_change')  applyMode(msg.remote);
       };
     }
 
     function setDot(ok) {
       document.getElementById('dot').className = 'status-dot' + (ok ? ' connected' : '');
+    }
+
+    function applyMode(remote) {
+      const toggle = document.getElementById('mode-toggle');
+      const desc   = document.getElementById('mode-desc');
+      const hint   = document.getElementById('mode-hint');
+      const lblN   = document.getElementById('lbl-native');
+      const lblR   = document.getElementById('lbl-remote');
+
+      toggle.checked = remote;
+      lblN.className = remote ? 'inactive' : 'active';
+      lblR.className = remote ? 'active'   : 'inactive';
+
+      if (remote) {
+        desc.textContent = 'Approvals routed here — Claude\'s terminal prompt is suppressed.';
+        hint.className = '';
+        hint.textContent = '';
+      } else {
+        desc.textContent = 'Claude\'s native terminal prompt is active.';
+        hint.className = 'visible';
+        hint.textContent = '⚠ Native mode: Claude Code will show its own Allow/Deny prompt in the terminal. Remote approvals are paused.';
+      }
+    }
+
+    async function onModeToggle(remote) {
+      try {
+        await fetch(`${serverUrl}/mode`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ remote }),
+        });
+      } catch(e) {
+        alert('Failed to change mode: ' + e.message);
+      }
     }
 
     function addCard(req) {
@@ -221,7 +326,7 @@
       card.className = 'card';
       card.id = `card-${req.id}`;
 
-      const cwd = req.cwd ? `<span style="color:var(--muted);font-size:0.73rem"> · ${req.cwd}</span>` : '';
+      const cwd = req.cwd ? `<span style="color:var(--muted);font-size:0.73rem"> · ${esc(req.cwd)}</span>` : '';
       const ago = new Date(req.created_at * 1000).toLocaleTimeString();
 
       card.innerHTML = `
@@ -239,7 +344,6 @@
       document.getElementById('pending-list').prepend(card);
       cards[req.id] = card;
 
-      // Browser notification if available
       if (Notification.permission === 'granted') {
         new Notification(`Claude wants to use: ${req.tool_name}`, {
           body: JSON.stringify(req.tool_input).slice(0, 120),
@@ -257,7 +361,6 @@
       badge.textContent = decision === 'allow' ? 'Allowed' : 'Denied';
       card.querySelector('.card-header').appendChild(badge);
 
-      // Move to history after 2 s
       setTimeout(() => {
         card.remove();
         addHistory(id, card.querySelector('.tool-badge').textContent, decision);
@@ -282,7 +385,6 @@
     async function decide(id, decision, btn) {
       btn.disabled = true;
       btn.closest('.card-actions').querySelectorAll('.btn').forEach(b => b.disabled = true);
-      // Optimistically update the UI immediately — don't wait for SSE echo
       markDecided(id, decision);
       try {
         await fetch(`${serverUrl}/decision/${id}`, {
@@ -301,12 +403,10 @@
         .replace(/"/g,'&quot;');
     }
 
-    // Request notification permission on load
     if ('Notification' in window && Notification.permission === 'default') {
       Notification.requestPermission();
     }
 
-    // Auto-connect on load
     connect();
   </script>
 </body>

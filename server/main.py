@@ -12,11 +12,88 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 # --------------------------------------------------------------------------- #
-# In-memory store (swap for Redis / SQLite if you want persistence across restart)
+# In-memory store
 # --------------------------------------------------------------------------- #
-pending: dict[str, dict] = {}          # request_id -> request details
-decisions: dict[str, str] = {}         # request_id -> "allow" | "deny"
-sse_queues: list[asyncio.Queue] = []   # one per connected SSE client
+pending: dict[str, dict] = {}
+decisions: dict[str, str] = {}
+sse_queues: list[asyncio.Queue] = []
+
+# --------------------------------------------------------------------------- #
+# Settings.json management
+# --------------------------------------------------------------------------- #
+
+SETTINGS_PATH = os.environ.get(
+    "CLAUDE_SETTINGS_PATH",
+    os.path.expanduser("~/.claude/settings.json"),
+)
+
+# Tools to add to "allow" when remote mode is active
+REMOTE_ALLOW = ["Bash(*)"]
+
+
+def read_settings() -> dict:
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def write_settings(data: dict):
+    os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
+    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def is_remote_mode() -> bool:
+    settings = read_settings()
+    allowed = settings.get("permissions", {}).get("allow", [])
+    return any(r in allowed for r in REMOTE_ALLOW)
+
+
+def set_remote_mode(enabled: bool):
+    settings = read_settings()
+    perms = settings.setdefault("permissions", {})
+    allowed: list = perms.get("allow", [])
+
+    if enabled:
+        for rule in REMOTE_ALLOW:
+            if rule not in allowed:
+                allowed.append(rule)
+    else:
+        allowed = [r for r in allowed if r not in REMOTE_ALLOW]
+
+    if allowed:
+        perms["allow"] = allowed
+    else:
+        perms.pop("allow", None)
+
+    if not perms:
+        settings.pop("permissions", None)
+
+    write_settings(settings)
+
+
+# --------------------------------------------------------------------------- #
+# Auto-restore: switch back to native mode when all SSE clients disconnect
+# --------------------------------------------------------------------------- #
+
+_restore_task: asyncio.Task | None = None
+
+async def _delayed_restore():
+    """Wait a few seconds, then restore native mode if still no clients."""
+    await asyncio.sleep(5)
+    if not sse_queues:
+        set_remote_mode(False)
+        print("[claude-gate] All clients disconnected — restored native prompt mode.")
+
+
+def schedule_restore_if_empty():
+    global _restore_task
+    if _restore_task and not _restore_task.done():
+        _restore_task.cancel()
+    if not sse_queues:
+        _restore_task = asyncio.create_task(_delayed_restore())
 
 
 @asynccontextmanager
@@ -24,7 +101,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Claude Remote Approval", lifespan=lifespan)
+app = FastAPI(title="Claude Gate", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -46,13 +123,15 @@ class ToolRequest(BaseModel):
 class DecisionBody(BaseModel):
     decision: str  # "allow" | "deny"
 
+class ModeBody(BaseModel):
+    remote: bool  # True = remote mode, False = native prompt
+
 
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
 
 async def broadcast(event: dict):
-    """Push an event to all connected SSE clients."""
     data = json.dumps(event)
     dead = []
     for q in sse_queues:
@@ -68,9 +147,20 @@ async def broadcast(event: dict):
 # Routes
 # --------------------------------------------------------------------------- #
 
+@app.get("/mode")
+async def get_mode():
+    return {"remote": is_remote_mode()}
+
+
+@app.post("/mode")
+async def set_mode(body: ModeBody):
+    set_remote_mode(body.remote)
+    await broadcast({"event": "mode_change", "remote": body.remote})
+    return {"remote": body.remote}
+
+
 @app.post("/request")
 async def create_request(body: ToolRequest):
-    """Hook script calls this to register a pending approval."""
     request_id = str(uuid.uuid4())
     record = {
         "id": request_id,
@@ -88,13 +178,11 @@ async def create_request(body: ToolRequest):
 
 @app.get("/pending")
 async def list_pending():
-    """Web / iOS app calls this to get all pending requests."""
     return list(pending.values())
 
 
 @app.post("/decision/{request_id}")
 async def make_decision(request_id: str, body: DecisionBody):
-    """Web / iOS app posts allow or deny here."""
     if request_id not in pending:
         raise HTTPException(404, "Request not found")
     if body.decision not in ("allow", "deny"):
@@ -108,10 +196,6 @@ async def make_decision(request_id: str, body: DecisionBody):
 
 @app.get("/poll/{request_id}")
 async def poll_decision(request_id: str, timeout: int = 300):
-    """
-    Hook script calls this to long-poll for a decision.
-    Blocks (up to `timeout` seconds) until a decision arrives.
-    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         if request_id in decisions:
@@ -120,20 +204,24 @@ async def poll_decision(request_id: str, timeout: int = 300):
             return {"decision": decision}
         await asyncio.sleep(0.5)
 
-    # Timed out — auto-deny to unblock Claude Code
     pending.pop(request_id, None)
     return {"decision": "deny", "reason": "timeout"}
 
 
 @app.get("/events")
 async def sse_stream(request: Request):
-    """Server-Sent Events endpoint for the web dashboard."""
     queue: asyncio.Queue = asyncio.Queue(maxsize=50)
     sse_queues.append(queue)
 
+    # Switching to remote mode as soon as a client connects
+    if not is_remote_mode():
+        set_remote_mode(True)
+        print("[claude-gate] Client connected — enabled remote mode.")
+
     async def generator() -> AsyncGenerator[str, None]:
         try:
-            # Send current pending requests on connect
+            # Send initial state
+            yield f"data: {json.dumps({'event': 'mode_change', 'remote': is_remote_mode()})}\n\n"
             for record in pending.values():
                 yield f"data: {json.dumps({'event': 'new_request', 'data': record})}\n\n"
 
@@ -144,21 +232,19 @@ async def sse_stream(request: Request):
                     data = await asyncio.wait_for(queue.get(), timeout=15)
                     yield f"data: {data}\n\n"
                 except asyncio.TimeoutError:
-                    yield ": heartbeat\n\n"  # keep connection alive
+                    yield ": heartbeat\n\n"
         finally:
             if queue in sse_queues:
                 sse_queues.remove(queue)
+            schedule_restore_if_empty()
 
     return StreamingResponse(
         generator(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "pending_count": len(pending)}
+    return {"status": "ok", "pending_count": len(pending), "remote_mode": is_remote_mode()}
