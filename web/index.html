@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Claude Remote Approval</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --border: #2a2d3a;
+      --text: #e2e4ec;
+      --muted: #7a7d8e;
+      --green: #22c55e;
+      --red: #ef4444;
+      --blue: #3b82f6;
+      --yellow: #f59e0b;
+      --radius: 10px;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'SF Mono', 'Cascadia Code', monospace;
+      min-height: 100vh;
+      padding: 24px;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 28px;
+    }
+
+    header h1 { font-size: 1.25rem; font-weight: 600; }
+
+    .status-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--red);
+      flex-shrink: 0;
+    }
+    .status-dot.connected { background: var(--green); animation: pulse 2s infinite; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    #server-url-bar {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 24px;
+    }
+
+    #server-url-bar input {
+      flex: 1;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      padding: 8px 14px;
+      font-family: inherit;
+      font-size: 0.875rem;
+    }
+
+    #server-url-bar button {
+      background: var(--blue);
+      color: #fff;
+      border: none;
+      border-radius: var(--radius);
+      padding: 8px 18px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 0.875rem;
+    }
+
+    #pending-list { display: flex; flex-direction: column; gap: 14px; }
+
+    .empty {
+      text-align: center;
+      color: var(--muted);
+      padding: 60px 0;
+      font-size: 0.9rem;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px 20px;
+      animation: slideIn 0.2s ease;
+    }
+
+    @keyframes slideIn {
+      from { opacity: 0; transform: translateY(-8px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .tool-badge {
+      background: rgba(59,130,246,0.15);
+      color: var(--blue);
+      border: 1px solid rgba(59,130,246,0.3);
+      border-radius: 6px;
+      padding: 2px 10px;
+      font-size: 0.8rem;
+      font-weight: 600;
+    }
+
+    .card-meta { color: var(--muted); font-size: 0.75rem; }
+
+    .card pre {
+      background: #0a0c14;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px;
+      font-size: 0.78rem;
+      line-height: 1.5;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+      margin-bottom: 14px;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+
+    .card-actions { display: flex; gap: 10px; }
+
+    .btn {
+      flex: 1;
+      padding: 10px;
+      border: none;
+      border-radius: 8px;
+      font-family: inherit;
+      font-size: 0.875rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+    .btn:hover { opacity: 0.85; }
+    .btn:disabled { opacity: 0.4; cursor: default; }
+
+    .btn-allow { background: var(--green); color: #000; }
+    .btn-deny  { background: var(--red);   color: #fff; }
+
+    .decided {
+      border-color: transparent;
+      opacity: 0.5;
+    }
+    .decided .card-actions { display: none; }
+
+    .badge-allowed { background: rgba(34,197,94,0.15); color: var(--green); border: 1px solid rgba(34,197,94,0.3); border-radius: 6px; padding: 2px 10px; font-size: 0.75rem; }
+    .badge-denied  { background: rgba(239,68,68,0.15);  color: var(--red);   border: 1px solid rgba(239,68,68,0.3);  border-radius: 6px; padding: 2px 10px; font-size: 0.75rem; }
+
+    #history-section { margin-top: 36px; }
+    #history-section h2 { font-size: 0.85rem; color: var(--muted); margin-bottom: 14px; text-transform: uppercase; letter-spacing: 0.08em; }
+    #history-list { display: flex; flex-direction: column; gap: 8px; }
+    .history-row { display: flex; align-items: center; gap: 12px; font-size: 0.78rem; color: var(--muted); }
+    .history-row .tool-name { color: var(--text); flex: 1; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="status-dot" id="dot"></div>
+    <h1>Claude Remote Approval</h1>
+  </header>
+
+  <div id="server-url-bar">
+    <input id="server-url" type="text" value="http://localhost:8000" placeholder="Server URL" />
+    <button onclick="connect()">Connect</button>
+  </div>
+
+  <div id="pending-list">
+    <div class="empty" id="empty-msg">No pending requests. Claude Code will prompt here when it needs approval.</div>
+  </div>
+
+  <div id="history-section" style="display:none">
+    <h2>Recent Decisions</h2>
+    <div id="history-list"></div>
+  </div>
+
+  <script>
+    let serverUrl = 'http://localhost:8000';
+    let evtSource = null;
+    const cards = {}; // request_id -> card element
+    const history = [];
+
+    function connect() {
+      serverUrl = document.getElementById('server-url').value.replace(/\/$/, '');
+
+      if (evtSource) evtSource.close();
+
+      evtSource = new EventSource(`${serverUrl}/events`);
+      evtSource.onopen = () => setDot(true);
+      evtSource.onerror = () => setDot(false);
+      evtSource.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.event === 'new_request') addCard(msg.data);
+        if (msg.event === 'decision') markDecided(msg.request_id, msg.decision);
+      };
+    }
+
+    function setDot(ok) {
+      document.getElementById('dot').className = 'status-dot' + (ok ? ' connected' : '');
+    }
+
+    function addCard(req) {
+      document.getElementById('empty-msg')?.remove();
+
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.id = `card-${req.id}`;
+
+      const cwd = req.cwd ? `<span style="color:var(--muted);font-size:0.73rem"> · ${req.cwd}</span>` : '';
+      const ago = new Date(req.created_at * 1000).toLocaleTimeString();
+
+      card.innerHTML = `
+        <div class="card-header">
+          <span class="tool-badge">${esc(req.tool_name)}</span>
+          <span class="card-meta">${ago}${cwd}</span>
+        </div>
+        <pre>${esc(JSON.stringify(req.tool_input, null, 2))}</pre>
+        <div class="card-actions">
+          <button class="btn btn-allow" onclick="decide('${req.id}','allow',this)">✓ Allow</button>
+          <button class="btn btn-deny"  onclick="decide('${req.id}','deny',this)">✕ Deny</button>
+        </div>
+      `;
+
+      document.getElementById('pending-list').prepend(card);
+      cards[req.id] = card;
+
+      // Browser notification if available
+      if (Notification.permission === 'granted') {
+        new Notification(`Claude wants to use: ${req.tool_name}`, {
+          body: JSON.stringify(req.tool_input).slice(0, 120),
+          tag: req.id,
+        });
+      }
+    }
+
+    function markDecided(id, decision) {
+      const card = cards[id];
+      if (!card) return;
+      card.classList.add('decided');
+      const badge = document.createElement('span');
+      badge.className = decision === 'allow' ? 'badge-allowed' : 'badge-denied';
+      badge.textContent = decision === 'allow' ? 'Allowed' : 'Denied';
+      card.querySelector('.card-header').appendChild(badge);
+
+      // Move to history after 2 s
+      setTimeout(() => {
+        card.remove();
+        addHistory(id, card.querySelector('.tool-badge').textContent, decision);
+      }, 2000);
+    }
+
+    function addHistory(id, tool, decision) {
+      history.unshift({ id, tool, decision, at: new Date().toLocaleTimeString() });
+      if (history.length > 20) history.pop();
+
+      document.getElementById('history-section').style.display = 'block';
+      const list = document.getElementById('history-list');
+      list.innerHTML = history.map(h => `
+        <div class="history-row">
+          <span class="tool-name">${esc(h.tool)}</span>
+          <span class="${h.decision === 'allow' ? 'badge-allowed' : 'badge-denied'}">${h.decision}</span>
+          <span>${h.at}</span>
+        </div>
+      `).join('');
+    }
+
+    async function decide(id, decision, btn) {
+      btn.disabled = true;
+      btn.closest('.card-actions').querySelectorAll('.btn').forEach(b => b.disabled = true);
+      try {
+        await fetch(`${serverUrl}/decision/${id}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ decision }),
+        });
+      } catch(e) {
+        alert('Failed to send decision: ' + e.message);
+        btn.disabled = false;
+      }
+    }
+
+    function esc(s) {
+      return String(s)
+        .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+        .replace(/"/g,'&quot;');
+    }
+
+    // Request notification permission on load
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+
+    // Auto-connect on load
+    connect();
+  </script>
+</body>
+</html>
