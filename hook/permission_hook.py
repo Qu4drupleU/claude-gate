@@ -107,10 +107,10 @@ def main():
 
     if decision == "allow":
         sys.stderr.write(f"[approval hook] ALLOWED: {tool_name}\n")
+        print(json.dumps({"decision": "allow"}))
         sys.exit(0)
     else:
         sys.stderr.write(f"[approval hook] DENIED: {tool_name}\n")
-        # Output a block decision so Claude knows why
         print(json.dumps({"decision": "block", "reason": "Denied remotely by user"}))
         sys.exit(2)
 
