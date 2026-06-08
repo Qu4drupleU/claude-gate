@@ -282,6 +282,8 @@
     async function decide(id, decision, btn) {
       btn.disabled = true;
       btn.closest('.card-actions').querySelectorAll('.btn').forEach(b => b.disabled = true);
+      // Optimistically update the UI immediately — don't wait for SSE echo
+      markDecided(id, decision);
       try {
         await fetch(`${serverUrl}/decision/${id}`, {
           method: 'POST',
@@ -290,7 +292,6 @@
         });
       } catch(e) {
         alert('Failed to send decision: ' + e.message);
-        btn.disabled = false;
       }
     }
 
